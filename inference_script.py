@@ -1,6 +1,7 @@
 from pathlib import Path
 import argparse
 import logging
+import time
 
 import torch
 from torchvision import transforms
@@ -16,6 +17,8 @@ from transformers import set_seed
 from typing import Dict, Tuple
 from diffusers.models.embeddings import get_3d_rotary_pos_embed
 from safetensors.torch import load_file
+from dove_vae_distill.profiling import StageProfiler
+from dove_vae_distill.runtime import install_student_vae
 
 import json
 import os
@@ -390,6 +393,22 @@ def prepare_rotary_positional_embeddings(
     )
 
     return freqs_cos, freqs_sin
+
+
+def prepare_inference_video(video_path, upscale, upscale_mode):
+    video, pad_f, pad_h, pad_w, original_shape = preprocess_video_match(video_path, is_match=True)
+    height, width = video.shape[2], video.shape[3]
+    video = torch.nn.functional.interpolate(
+        video,
+        size=(height * upscale, width * upscale),
+        mode=upscale_mode,
+        align_corners=False,
+    )
+    frame_transform = transforms.Compose(
+        [transforms.Lambda(lambda frame: frame / 255.0 * 2.0 - 1.0)]
+    )
+    video = torch.stack([frame_transform(frame) for frame in video], dim=0)
+    return video.unsqueeze(0).permute(0, 2, 1, 3, 4).contiguous(), pad_f, pad_h, pad_w, original_shape
     
 @no_grad
 def process_video(
@@ -399,14 +418,18 @@ def process_video(
     noise_step: int = 0,
     sr_noise_step: int = 399,
     empty_prompt_embedding: torch.Tensor = None,
+    stage_profiler: StageProfiler = None,
+    return_decoder_input: bool = False,
 ):
     # SR the video frames based on the prompt.
     # `num_frames` is the Number of frames to generate.
 
     # Decode video
-    video = video.to(pipe.vae.device, dtype=pipe.vae.dtype)
-    latent_dist = pipe.vae.encode(video).latent_dist
-    latent = latent_dist.sample() * pipe.vae.config.scaling_factor
+    profiler = stage_profiler or StageProfiler()
+    with profiler.measure("vae_encode"):
+        video = video.to(pipe.vae.device, dtype=pipe.vae.dtype)
+        latent_dist = pipe.vae.encode(video).latent_dist
+        latent = latent_dist.sample() * pipe.vae.config.scaling_factor
 
     patch_size_t = pipe.transformer.config.patch_size_t
     if patch_size_t is not None:
@@ -428,20 +451,21 @@ def process_video(
             prompt_embedding = prompt_embedding.repeat(batch_size, 1, 1)
     else:
         # Encode the prompt
-        prompt_token_ids = pipe.tokenizer(
-            prompt,
-            padding="max_length",
-            max_length=pipe.transformer.config.max_text_seq_length,
-            truncation=True,
-            add_special_tokens=True,
-            return_tensors="pt",
-        )
-        prompt_token_ids = prompt_token_ids.input_ids
-        prompt_embedding = pipe.text_encoder(
-            prompt_token_ids.to(latent.device)
-        )[0]
-        _, seq_len, _ = prompt_embedding.shape
-        prompt_embedding = prompt_embedding.view(batch_size, seq_len, -1).to(dtype=latent.dtype)
+        with profiler.measure("prompt_encode"):
+            prompt_token_ids = pipe.tokenizer(
+                prompt,
+                padding="max_length",
+                max_length=pipe.transformer.config.max_text_seq_length,
+                truncation=True,
+                add_special_tokens=True,
+                return_tensors="pt",
+            )
+            prompt_token_ids = prompt_token_ids.input_ids
+            prompt_embedding = pipe.text_encoder(
+                prompt_token_ids.to(latent.device)
+            )[0]
+            _, seq_len, _ = prompt_embedding.shape
+            prompt_embedding = prompt_embedding.view(batch_size, seq_len, -1).to(dtype=latent.dtype)
 
     latent = latent.permute(0, 2, 1, 3, 4)
 
@@ -480,26 +504,33 @@ def process_video(
     )
 
     # Predict noise
-    predicted_noise = pipe.transformer(
-        hidden_states=latent,
-        encoder_hidden_states=prompt_embedding,
-        timestep=timesteps,
-        image_rotary_emb=rotary_emb,
-        return_dict=False,
-    )[0]
+    with profiler.measure("transformer"):
+        predicted_noise = pipe.transformer(
+            hidden_states=latent,
+            encoder_hidden_states=prompt_embedding,
+            timestep=timesteps,
+            image_rotary_emb=rotary_emb,
+            return_dict=False,
+        )[0]
     
-    latent_generate = pipe.scheduler.get_velocity(
-        predicted_noise, latent, timesteps
-    )
+    with profiler.measure("scheduler_update"):
+        latent_generate = pipe.scheduler.get_velocity(
+            predicted_noise, latent, timesteps
+        )
 
     # generate video
     if patch_size_t is not None and ncopy > 0:
         latent_generate = latent_generate[:, ncopy:, :, :, :]
 
     # [B, C, F, H, W]
-    video_generate = pipe.decode_latents(latent_generate)
-    video_generate = (video_generate * 0.5 + 0.5).clamp(0.0, 1.0)
-    
+    decoder_input = latent_generate.permute(0, 2, 1, 3, 4)
+    decoder_input = decoder_input / pipe.vae_scaling_factor_image
+    with profiler.measure("vae_decode"):
+        video_generate = pipe.decode_latents(latent_generate)
+        video_generate = (video_generate * 0.5 + 0.5).clamp(0.0, 1.0)
+
+    if return_decoder_input:
+        return video_generate, decoder_input
     return video_generate
 
 
@@ -551,7 +582,52 @@ if __name__ == "__main__":
 
     parser.add_argument("--overlap_t", type=int, default=8)
 
+    parser.add_argument("--profile_stages", action="store_true", help="Profile major inference stages")
+
+    parser.add_argument("--profile_output", type=str, default=None, help="Path for stage profile JSON")
+
+    parser.add_argument("--max_videos", type=int, default=0, help="Limit input videos; 0 processes all videos")
+
+    parser.add_argument(
+        "--vae_decoder_layers_per_up_block",
+        type=int,
+        nargs=4,
+        default=None,
+        help="Per-up-block decoder depth profile, from lowest to highest resolution",
+    )
+
+    parser.add_argument(
+        "--vae_decoder_checkpoint",
+        type=str,
+        default=None,
+        help="Distilled decoder checkpoint produced by dove_vae_distill.cli.train_decoder",
+    )
+
+    parser.add_argument(
+        "--vae_encoder_layers_per_down_block",
+        type=int,
+        nargs=4,
+        default=None,
+        help="Per-down-block encoder depth profile, from highest to lowest resolution",
+    )
+
+    parser.add_argument(
+        "--vae_encoder_mid_block_layers",
+        type=int,
+        default=1,
+        help="Residual layers retained in the encoder mid block",
+    )
+
+    parser.add_argument(
+        "--vae_encoder_checkpoint",
+        type=str,
+        default=None,
+        help="Distilled encoder checkpoint produced by dove_vae_distill.cli.train_encoder",
+    )
+
     args = parser.parse_args()
+    run_start = time.perf_counter()
+    stage_profiler = StageProfiler(enabled=args.profile_stages)
 
     if args.dtype == "float16":
         dtype = torch.float16
@@ -578,7 +654,11 @@ if __name__ == "__main__":
 
     # Load empty prompt embedding if exists
     empty_prompt_embedding = None
-    empty_prompt_path = Path("pretrained_models/prompt_embeddings/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855.safetensors")
+    empty_prompt_path = (
+        Path(args.model_path).parent
+        / "prompt_embeddings"
+        / "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855.safetensors"
+    )
     if empty_prompt_path.exists():
         try:
             empty_prompt_embedding = load_file(str(empty_prompt_path))["prompt_embedding"]
@@ -601,6 +681,9 @@ if __name__ == "__main__":
         video_files.extend(glob.glob(os.path.join(args.input_dir, f'*{ext}')))
     video_files = sorted(video_files)  # Sort files for consistent ordering
 
+    if args.max_videos > 0:
+        video_files = video_files[: args.max_videos]
+
     if not video_files:
         raise ValueError(f"No video files found in {args.input_dir}")
     
@@ -610,7 +693,8 @@ if __name__ == "__main__":
     # add device_map="balanced" in the from_pretrained function and remove the enable_model_cpu_offload()
     # function to use Multi GPUs.
 
-    pipe = CogVideoXPipeline.from_pretrained(args.model_path, torch_dtype=dtype)
+    with stage_profiler.measure("model_load"):
+        pipe = CogVideoXPipeline.from_pretrained(args.model_path, torch_dtype=dtype)
 
     # If you're using with lora, add this code
     if args.lora_path:
@@ -634,11 +718,21 @@ if __name__ == "__main__":
     # turn off if you have multiple GPUs or enough GPU memory(such as H100) and it will cost less time in inference
     # and enable to("cuda")
 
-    if args.is_cpu_offload:
-        # pipe.enable_model_cpu_offload()
-        pipe.enable_sequential_cpu_offload()
-    else:
-        pipe.to("cuda")
+    with stage_profiler.measure("model_to_device"):
+        if args.is_cpu_offload:
+            # pipe.enable_model_cpu_offload()
+            pipe.enable_sequential_cpu_offload()
+        else:
+            pipe.to("cuda")
+
+    vae_install = install_student_vae(
+        pipe,
+        decoder_profile=args.vae_decoder_layers_per_up_block,
+        decoder_checkpoint_path=args.vae_decoder_checkpoint,
+        encoder_profile=args.vae_encoder_layers_per_down_block,
+        encoder_mid_block_layers=args.vae_encoder_mid_block_layers,
+        encoder_checkpoint_path=args.vae_encoder_checkpoint,
+    )
     
     if args.is_vae_st:
         pipe.vae.enable_slicing()
@@ -660,23 +754,17 @@ if __name__ == "__main__":
     else:
         metrics_models = None
         metric_accumulator = None
-    
+
     for video_path in tqdm(video_files, desc="Processing videos"):
         video_name = os.path.basename(video_path)
         prompt = video_prompt_dict.get(video_name, "")
         if os.path.exists(video_path):
-            # Read video
-            # [F, C, H, W]
-            video, pad_f, pad_h, pad_w, original_shape = preprocess_video_match(video_path, is_match=True)
-            H_, W_ = video.shape[2], video.shape[3]
-            video = torch.nn.functional.interpolate(video, size=(H_*args.upscale, W_*args.upscale), mode=args.upscale_mode, align_corners=False)
-            __frame_transform = transforms.Compose(
-                [transforms.Lambda(lambda x: x / 255.0 * 2.0 - 1.0)] # -1, 1
-            )
-            video = torch.stack([__frame_transform(f) for f in video], dim=0)
-            video = video.unsqueeze(0)
-            # [B, C, F, H, W]
-            video = video.permute(0, 2, 1, 3, 4).contiguous()
+            with stage_profiler.measure("preprocess"):
+                video, pad_f, pad_h, pad_w, original_shape = prepare_inference_video(
+                    video_path,
+                    args.upscale,
+                    args.upscale_mode,
+                )
 
             _B, _C, _F, _H, _W = video.shape
             time_chunks = make_temporal_chunks(_F, args.chunk_len, overlap_t)
@@ -700,6 +788,7 @@ if __name__ == "__main__":
                         noise_step=args.noise_step,
                         sr_noise_step=args.sr_noise_step,
                         empty_prompt_embedding=empty_prompt_embedding,
+                        stage_profiler=stage_profiler,
                     )
 
                     region = get_valid_tile_region(
@@ -742,13 +831,14 @@ if __name__ == "__main__":
                     gt_frames = None
                 compute_metrics(pred_frames, gt_frames, metrics_models, metric_accumulator, file_name)
 
-            if args.png_save:
-                # Save as PNG sequence
-                output_dir = output_path.rsplit('.', 1)[0]  # Remove extension
-                save_frames_as_png(video_generate, output_dir, fps=args.fps)
-            else:
-                output_path = output_path.replace('.mkv', '.mp4')
-                save_video_with_imageio(video_generate, output_path, fps=args.fps, format=args.save_format)
+            with stage_profiler.measure("save_output"):
+                if args.png_save:
+                    # Save as PNG sequence
+                    output_dir = output_path.rsplit('.', 1)[0]  # Remove extension
+                    save_frames_as_png(video_generate, output_dir, fps=args.fps)
+                else:
+                    output_path = output_path.replace('.mkv', '.mp4')
+                    save_video_with_imageio(video_generate, output_path, fps=args.fps, format=args.save_format)
         else:
             print(f"Warning: {video_name} not found in {args.input_dir}")
 
@@ -774,5 +864,34 @@ if __name__ == "__main__":
         }
         with open(out_path, 'w') as f:
             json.dump(output, f, indent=2)
+
+    if args.profile_stages:
+        profile_output = args.profile_output or os.path.join(args.output_path, "stage_profile.json")
+        profile_report = stage_profiler.build_report(
+            run_wall_seconds=time.perf_counter() - run_start,
+            metadata={
+                "input_dir": args.input_dir,
+                "model_path": args.model_path,
+                "dtype": args.dtype,
+                "video_count": len(video_files),
+                "chunk_len": args.chunk_len,
+                "overlap_t": overlap_t,
+                "tile_size_hw": list(args.tile_size_hw),
+                "overlap_hw": list(overlap_hw),
+                "vae_slicing_tiling": args.is_vae_st,
+                "compile_vae": False,
+                "vae_decoder_layers_per_up_block": vae_install["decoder_profile"],
+                "vae_decoder_checkpoint": args.vae_decoder_checkpoint,
+                "vae_encoder_layers_per_down_block": vae_install["encoder_profile"],
+                "vae_encoder_mid_block_layers": vae_install["encoder_mid_block_layers"],
+                "vae_encoder_checkpoint": args.vae_encoder_checkpoint,
+            },
+        )
+        os.makedirs(os.path.dirname(os.path.abspath(profile_output)), exist_ok=True)
+        with open(profile_output, "w") as f:
+            json.dump(profile_report, f, indent=2)
+        print("\n=== DOVE Stage Profile ===")
+        print(json.dumps(profile_report, indent=2))
+        print(f"DOVE_STAGE_PROFILE_JSON={profile_output}")
 
     print("All videos processed.")

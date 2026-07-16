@@ -1,0 +1,6 @@
+-r requirements.txt
+
+# The upstream README installs these separately; the distillation path requires them.
+diffusers[torch]>=0.35.1
+pyiqa>=0.1.13
+pytest>=8.0

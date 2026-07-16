@@ -161,7 +161,11 @@ def process(gt_root, pred_root, out_path, metrics, batch_mode, crop, test_y_chan
 
     if has_gt:
         gt_files = {os.path.splitext(f)[0]: os.path.join(gt_root, f) for f in os.listdir(gt_root)}
-    pred_files = {os.path.splitext(f)[0]: os.path.join(pred_root, f) for f in os.listdir(pred_root)}
+    pred_files = {
+        os.path.splitext(f)[0]: os.path.join(pred_root, f)
+        for f in os.listdir(pred_root)
+        if os.path.isdir(os.path.join(pred_root, f)) or is_video_file(f)
+    }
 
     pred_names = sorted(pred_files.keys())
     results = {}
