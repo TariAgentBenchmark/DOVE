@@ -3,4 +3,5 @@
 # The upstream README installs these separately; the distillation path requires them.
 diffusers[torch]>=0.35.1
 pyiqa>=0.1.13
+python-docx>=1.1
 pytest>=8.0

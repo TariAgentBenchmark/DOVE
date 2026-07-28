@@ -40,6 +40,16 @@ def main():
     candidate_temporal = load_json(
         evaluation / "candidate_metrics" / "metrics_temporal_raft.json"
     )["average"]
+    gpu_info_path = evaluation / "gpu_info.txt"
+    gpu_info = (
+        [
+            line.strip()
+            for line in gpu_info_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        if gpu_info_path.is_file()
+        else []
+    )
 
     baseline_steady = steady_seconds(baseline_profile)
     candidate_steady = steady_seconds(candidate_profile)
@@ -57,6 +67,7 @@ def main():
         "candidate_metrics": candidate_metrics,
         "baseline_temporal": baseline_temporal,
         "candidate_temporal": candidate_temporal,
+        "gpu_info": gpu_info,
         "passes_1_5x": baseline_steady / candidate_steady >= 1.5,
     }
     output_path = evaluation / "summary.json"

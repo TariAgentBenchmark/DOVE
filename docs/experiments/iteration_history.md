@@ -683,3 +683,60 @@ The lightweight encoder plus trajectory-distilled decoder is accepted against th
 - LPIPS/DISTS and temporal errors: modest `0.85%` to `4.10%` regressions, with no obvious instability in the sampled visual audit.
 
 The result should be presented as **meeting the threshold with a small quality tradeoff**, not as matching or improving every original DOVE metric. The production deliverable consists of both the encoder checkpoint above and decoder checkpoint `/data/42-julia-hpc-rz-cv/sig95vg/arb_dove_outputs/vae_decoder_distill/decoder_1112_s4100_2812937/checkpoint-4100/decoder.pt`.
+
+## Encoder-Matched Perceptual Recovery
+
+Date: 2026-07-22 to 2026-07-29
+
+The customer tightened the quality requirement: PSNR/SSIM may decrease modestly, but LPIPS, DISTS, and CLIPIQA must each be no worse than original DOVE. The previous lightweight VAE did not meet that requirement (`LPIPS 0.2818`, `DISTS 0.1553`, `CLIPIQA 0.4988`).
+
+### Encoder-Matched Cache
+
+Job `2921911` regenerated the decoder-input trajectory with the accepted lightweight encoder rather than the original DOVE encoder. For each of 1024 HQ-VSR samples, the cache stores:
+
+- the decoder-input latent produced by the lightweight encoder and unchanged DOVE transformer;
+- the original DOVE RGB teacher output from the matching dataset index;
+- the corresponding GT video;
+- source path, dataset index, and deterministic seed.
+
+The cache completed `1024/1024` entries with zero failures. This removes the train/inference latent-distribution mismatch while retaining the original DOVE output as a conservative teacher.
+
+### Three-Stage Search
+
+Jobs `2921912_[0-2]` and `2921913_[0-2]` tested conservative, perceptual, and CLIPIQA-margin objectives for 200 continuation steps. All three improved CLIPIQA, but none met both LPIPS and DISTS gates. The `perceptual` checkpoint-4300 was selected because it had the lowest LPIPS (`0.2739`) and a stable quality/temporal profile.
+
+Jobs `2974916_[0-2]` and `2974917_[0-5]` continued that checkpoint with balanced, DISTS-focused, and LPIPS-focused objectives, evaluating checkpoints 4350 and 4400. `lpips_focus` checkpoint-4400 reached DISTS `0.1504` and CLIPIQA `0.5453`, while LPIPS `0.2712` remained only `0.0005` above the DOVE gate.
+
+Jobs `2974989_[0-1]` and `2975000_[0-3]` ran two final 100-step continuations. `lpips_continue` checkpoint-4500 was selected over `lpips_push` because it passed all image-quality gates with the more conservative objective and slightly better DISTS/temporal behavior.
+
+Final decoder checkpoint:
+
+`/data/42-julia-hpc-rz-cv/sig95vg/arb_dove_outputs/perceptual_finish/perceptual-finish-finish-normalh100-v2_20260730/models/lpips_continue/checkpoint-4500/decoder.pt`
+
+### Final Candidate Quality
+
+| Model | PSNR | SSIM | LPIPS | DISTS | CLIPIQA | RAFT warp L1 | Frame-difference L1 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Same-run original DOVE | 26.5348 | 0.7694 | 0.2707 | 0.1519 | 0.5016 | 0.010366 | 0.024122 |
+| Previous lightweight VAE | 26.0109 | 0.7675 | 0.2818 | 0.1553 | 0.4988 | 0.01052 | 0.02433 |
+| `lpips_continue`, checkpoint 4500 | 26.0513 | 0.7638 | **0.2701** | **0.1485** | **0.5500** | 0.010531 | 0.024242 |
+
+Relative to the previous lightweight VAE, LPIPS improves by `4.15%`, DISTS by `4.38%`, and CLIPIQA by `10.26%`. Relative to the same-run original DOVE, the candidate improves all three perceptual metrics. RAFT warp and frame-difference errors increase by only `1.59%` and `0.50%`, below the `5%` limit. Visual audits on UDM10 videos `000`, `002`, `005`, and `007` at frames 5, 15, and 25 found no new flicker, structural jump, material color shift, or sharpening halo.
+
+### Final Same-L40S Acceptance
+
+Same-card L40 diagnostic job `2975057`, with both models running without `torch.compile`, measured:
+
+| Single-L40 diagnostic | Steady end-to-end | Speedup | Core inference | Core speedup |
+|---|---:|---:|---:|---:|
+| Original DOVE | 466.29 s | 1.000x | 451.02 s | 1.000x |
+| Final lightweight VAE | 296.04 s | **1.575x** | 280.28 s | **1.609x** |
+
+The diagnostic confirmed that the perceptual continuation preserved the architecture-level speedup. Official job `2975014` subsequently ran both models sequentially on one NVIDIA L40S with `torch.compile` disabled:
+
+| Single-L40S final acceptance | Steady end-to-end | Speedup | Core inference | Core speedup |
+|---|---:|---:|---:|---:|
+| Original DOVE | 416.59 s | 1.000x | 403.49 s | 1.000x |
+| Final lightweight VAE | 273.00 s | **1.526x** | 248.56 s | **1.623x** |
+
+The allocation record is `gres/gpu:l40s=1`; the runtime log reports `NVIDIA L40S, 46068 MiB, driver 590.48.01`. The same official output measures PSNR `26.0497`, SSIM `0.7638`, LPIPS `0.2700`, DISTS `0.1485`, CLIPIQA `0.5509`, RAFT warp `0.010530`, and frame-difference `0.024242`. All customer speed, perceptual, PSNR, and temporal gates pass. Checkpoint 4500 is therefore the released pure-algorithm candidate.

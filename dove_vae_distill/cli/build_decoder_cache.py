@@ -1,6 +1,7 @@
 import argparse
 import json
 import shutil
+import traceback
 from pathlib import Path
 
 import torch
@@ -16,7 +17,29 @@ from dove_vae_distill.data import (
     parse_resolution,
     set_sample_seed,
 )
+from dove_vae_distill.runtime import install_student_vae
 from inference_script import process_video
+
+
+def load_teacher_cache_index(cache_dir: Path | None) -> dict[int, Path]:
+    if cache_dir is None:
+        return {}
+    manifest_path = cache_dir / "manifest.json"
+    with open(manifest_path) as handle:
+        manifest = json.load(handle)
+    records = manifest.get("records", manifest.get("samples", []))
+    index = {}
+    for record in records:
+        dataset_index = int(record["dataset_index"])
+        if dataset_index in index:
+            raise ValueError(f"Duplicate dataset_index={dataset_index} in {manifest_path}")
+        sample_path = cache_dir / "samples" / record["sample"]
+        if not sample_path.is_file():
+            raise FileNotFoundError(sample_path)
+        index[dataset_index] = sample_path
+    if not index:
+        raise ValueError(f"Teacher cache has no samples: {cache_dir}")
+    return index
 
 
 @torch.inference_mode()
@@ -43,6 +66,30 @@ def main():
     parser.add_argument("--prompt_cache", type=str, default="prompt_embeddings")
     parser.add_argument("--empty_prompt", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
+        "--trajectory_encoder_checkpoint",
+        type=Path,
+        default=None,
+        help="Optional distilled encoder used to generate the cached decoder-input trajectory",
+    )
+    parser.add_argument(
+        "--trajectory_encoder_layers_per_down_block",
+        type=int,
+        nargs=4,
+        default=None,
+    )
+    parser.add_argument("--trajectory_encoder_mid_block_layers", type=int, default=1)
+    parser.add_argument(
+        "--teacher_cache_dir",
+        type=Path,
+        default=None,
+        help="Existing original-DOVE trajectory cache supplying teacher RGB targets",
+    )
+    parser.add_argument(
+        "--store_ground_truth",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
         "--enable_vae_slicing_tiling",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -67,6 +114,14 @@ def main():
     set_seed(args.seed)
     dataset = build_training_dataset(args, frames=frames, height=height, width=width)
     pipe = load_teacher_pipeline(args, dtype=dtype, device=device)
+    teacher_cache_index = load_teacher_cache_index(args.teacher_cache_dir)
+    if args.trajectory_encoder_checkpoint is not None:
+        install_student_vae(
+            pipe,
+            encoder_profile=args.trajectory_encoder_layers_per_down_block,
+            encoder_mid_block_layers=args.trajectory_encoder_mid_block_layers,
+            encoder_checkpoint_path=args.trajectory_encoder_checkpoint,
+        )
     prompt_embedding_cache = {}
     records = []
     failures = []
@@ -105,7 +160,7 @@ def main():
                     device=device,
                 )
             prompt_embedding = prompt_embedding_cache[prompt]
-            teacher_video_01, decoder_input = process_video(
+            trajectory_video_01, decoder_input = process_video(
                 pipe=pipe,
                 video=condition,
                 prompt=prompt,
@@ -113,20 +168,52 @@ def main():
                 empty_prompt_embedding=prompt_embedding.unsqueeze(0),
                 return_decoder_input=True,
             )
-            teacher_video = (
-                teacher_video_01.detach().cpu().float().clamp(0.0, 1.0) * 255.0
-            ).round().to(torch.uint8)
-            sample_name = f"{len(records):05d}.pt"
-            torch.save(
-                {
-                    "latent": decoder_input.detach().cpu().to(torch.float16),
-                    "teacher_video": teacher_video,
-                    "source_video": str(video_path),
-                    "dataset_index": dataset_index,
-                    "seed": args.seed + dataset_index * 1009,
-                },
-                samples_dir / sample_name,
+            if teacher_cache_index:
+                teacher_sample_path = teacher_cache_index.get(dataset_index)
+                if teacher_sample_path is None:
+                    raise KeyError(
+                        f"dataset_index={dataset_index} is missing from {args.teacher_cache_dir}"
+                    )
+                teacher_sample = torch.load(
+                    teacher_sample_path,
+                    map_location="cpu",
+                    weights_only=False,
+                )
+                teacher_video = teacher_sample["teacher_video"]
+                cached_source = Path(teacher_sample.get("source_video", video_path)).name
+                if cached_source != video_path.name:
+                    raise ValueError(
+                        "Teacher cache source mismatch for "
+                        f"dataset_index={dataset_index}: {cached_source} != {video_path.name}"
+                    )
+            else:
+                teacher_video = (
+                    trajectory_video_01.detach().cpu().float().clamp(0.0, 1.0) * 255.0
+                ).round().to(torch.uint8)
+            gt_video = (
+                hq_raw.permute(1, 0, 2, 3)
+                .contiguous()
+                .round()
+                .clamp(0, 255)
+                .to(torch.uint8)
+                .unsqueeze(0)
             )
+            if teacher_video.shape != gt_video.shape:
+                raise ValueError(
+                    f"Teacher/GT shape mismatch: {tuple(teacher_video.shape)} != "
+                    f"{tuple(gt_video.shape)}"
+                )
+            sample_name = f"{len(records):05d}.pt"
+            sample = {
+                "latent": decoder_input.detach().cpu().to(torch.float16),
+                "teacher_video": teacher_video,
+                "source_video": str(video_path),
+                "dataset_index": dataset_index,
+                "seed": args.seed + dataset_index * 1009,
+            }
+            if args.store_ground_truth:
+                sample["gt_video"] = gt_video
+            torch.save(sample, samples_dir / sample_name)
             records.append(
                 {
                     "sample": sample_name,
@@ -135,24 +222,39 @@ def main():
                 }
             )
             print(f"[{len(records)}/{args.num_samples}] cached {video_path.name}", flush=True)
-            del condition, decoder_input, teacher_video_01, teacher_video
+            del condition, decoder_input, trajectory_video_01, teacher_video, gt_video
             torch.cuda.empty_cache()
         except Exception as exc:
             failures.append({"source_video": str(video_path), "error": repr(exc)})
             print(f"Failed {video_path}: {exc!r}", flush=True)
+            traceback.print_exc()
 
     manifest = {
-        "format": "dove_decoder_trajectory_cache_v1",
+        "format": "dove_decoder_trajectory_cache_v2_encoder_matched",
         "model_path": args.model_path,
         "num_entries": len(records),
         "train_resolution": {"frames": frames, "height": height, "width": width},
         "sr_noise_step": args.sr_noise_step,
+        "trajectory_encoder_checkpoint": (
+            str(args.trajectory_encoder_checkpoint)
+            if args.trajectory_encoder_checkpoint is not None
+            else None
+        ),
+        "teacher_cache_dir": (
+            str(args.teacher_cache_dir) if args.teacher_cache_dir is not None else None
+        ),
+        "stores_ground_truth": args.store_ground_truth,
         "records": records,
         "failures": failures,
     }
     with open(args.output_dir / "manifest.json", "w") as handle:
         json.dump(manifest, handle, indent=2)
     print(json.dumps({"count": len(records), "failures": len(failures)}, indent=2))
+    if failures or len(records) != args.num_samples:
+        raise RuntimeError(
+            f"Cache incomplete: expected {args.num_samples}, wrote {len(records)}, "
+            f"failures={len(failures)}"
+        )
 
 
 if __name__ == "__main__":

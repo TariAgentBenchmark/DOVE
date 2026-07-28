@@ -22,10 +22,20 @@ def parse_args():
     parser.add_argument("--layers_per_up_block", type=int, nargs=4, default=None)
     parser.add_argument("--max_steps", type=int, default=500)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
+    parser.add_argument("--teacher_l1_weight", type=float, default=1.0)
     parser.add_argument("--mse_weight", type=float, default=0.5)
+    parser.add_argument("--gt_l1_weight", type=float, default=0.0)
     parser.add_argument("--frame_diff_weight", type=float, default=0.2)
     parser.add_argument("--dists_weight", type=float, default=0.01)
     parser.add_argument("--dists_every", type=int, default=4)
+    parser.add_argument("--lpips_weight", type=float, default=0.0)
+    parser.add_argument("--lpips_every", type=int, default=4)
+    parser.add_argument(
+        "--perceptual_target",
+        choices=("teacher", "gt"),
+        default="teacher",
+        help="Reference used by DISTS, LPIPS, and high-frequency losses",
+    )
     parser.add_argument("--high_frequency_weight", type=float, default=0.0)
     parser.add_argument("--clipiqa_weight", type=float, default=0.0)
     parser.add_argument("--clipiqa_every", type=int, default=1)
@@ -47,7 +57,9 @@ class DecoderCacheDataset(Dataset):
 
     def __getitem__(self, index):
         sample = torch.load(self.samples[index], map_location="cpu", weights_only=False)
-        return sample["latent"][0], sample["teacher_video"][0]
+        teacher = sample["teacher_video"][0]
+        ground_truth = sample.get("gt_video", sample["teacher_video"])[0]
+        return sample["latent"][0], teacher, ground_truth
 
 
 def decode_temporal_batches(decoder, latent, frame_batch_size=2):
@@ -90,6 +102,18 @@ def save_checkpoint(student, optimizer, step, args, decoder_profile):
             "config": {
                 "layers_per_block": args.layers_per_block if args.layers_per_up_block is None else 0,
                 "layers_per_up_block": list(decoder_profile),
+                "objective": {
+                    "teacher_l1_weight": args.teacher_l1_weight,
+                    "mse_weight": args.mse_weight,
+                    "gt_l1_weight": args.gt_l1_weight,
+                    "frame_diff_weight": args.frame_diff_weight,
+                    "dists_weight": args.dists_weight,
+                    "lpips_weight": args.lpips_weight,
+                    "perceptual_target": args.perceptual_target,
+                    "high_frequency_weight": args.high_frequency_weight,
+                    "clipiqa_weight": args.clipiqa_weight,
+                    "clipiqa_target": args.clipiqa_target,
+                },
             },
         },
         checkpoint_dir / "decoder.pt",
@@ -158,6 +182,11 @@ def main():
         if args.dists_weight > 0
         else None
     )
+    lpips = freeze_metric(
+        pyiqa.create_metric("lpips", as_loss=True).to(device)
+        if args.lpips_weight > 0
+        else None
+    )
     clipiqa = freeze_metric(
         pyiqa.create_metric("clipiqa", as_loss=True).to(device)
         if args.clipiqa_weight > 0
@@ -168,22 +197,34 @@ def main():
     student.train()
     for step in trange(start_step + 1, args.max_steps + 1, desc="Decoder distillation"):
         try:
-            latent, target_u8 = next(iterator)
+            latent, teacher_u8, gt_u8 = next(iterator)
         except StopIteration:
             iterator = iter(loader)
-            latent, target_u8 = next(iterator)
+            latent, teacher_u8, gt_u8 = next(iterator)
 
         latent = latent.to(device=device, dtype=torch.bfloat16, non_blocking=True)
-        target = target_u8.to(device=device, dtype=torch.float32, non_blocking=True) / 127.5 - 1.0
+        teacher = (
+            teacher_u8.to(device=device, dtype=torch.float32, non_blocking=True) / 127.5
+            - 1.0
+        )
+        ground_truth = (
+            gt_u8.to(device=device, dtype=torch.float32, non_blocking=True) / 127.5
+            - 1.0
+        )
+        perceptual_target = ground_truth if args.perceptual_target == "gt" else teacher
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             prediction = decode_temporal_batches(student, latent)
-            l1_loss = F.l1_loss(prediction.float(), target)
-            mse_loss = F.mse_loss(prediction.float(), target) * args.mse_weight
+            l1_loss = (
+                F.l1_loss(prediction.float(), teacher) * args.teacher_l1_weight
+            )
+            mse_loss = F.mse_loss(prediction.float(), teacher) * args.mse_weight
+            gt_l1_loss = F.l1_loss(prediction.float(), ground_truth) * args.gt_l1_weight
             pred_diff = prediction[:, :, 1:] - prediction[:, :, :-1]
-            target_diff = target[:, :, 1:] - target[:, :, :-1]
+            target_diff = teacher[:, :, 1:] - teacher[:, :, :-1]
             frame_diff_loss = F.l1_loss(pred_diff.float(), target_diff) * args.frame_diff_weight
             perceptual_loss = torch.zeros((), device=device)
+            lpips_loss = torch.zeros((), device=device)
             high_frequency_loss = torch.zeros((), device=device)
             clipiqa_loss = torch.zeros((), device=device)
             student_clipiqa = torch.zeros((), device=device)
@@ -192,21 +233,27 @@ def main():
             use_clipiqa = clipiqa is not None and step % args.clipiqa_every == 0
             if (
                 (dists is not None and step % args.dists_every == 0)
+                or (lpips is not None and step % args.lpips_every == 0)
                 or args.high_frequency_weight > 0
                 or use_clipiqa
             ):
                 frame_index = random.randrange(prediction.shape[2])
                 pred_frame = (prediction[:, :, frame_index].float() * 0.5 + 0.5).clamp(0.0, 1.0)
-                target_frame = (target[:, :, frame_index] * 0.5 + 0.5).clamp(0.0, 1.0)
+                target_frame = (
+                    perceptual_target[:, :, frame_index] * 0.5 + 0.5
+                ).clamp(0.0, 1.0)
+                teacher_frame = (teacher[:, :, frame_index] * 0.5 + 0.5).clamp(0.0, 1.0)
                 if dists is not None and step % args.dists_every == 0:
                     perceptual_loss = dists(pred_frame, target_frame) * args.dists_weight
+                if lpips is not None and step % args.lpips_every == 0:
+                    lpips_loss = lpips(pred_frame, target_frame) * args.lpips_weight
                 if args.high_frequency_weight > 0:
                     high_frequency_loss = (
                         laplacian_loss(pred_frame, target_frame) * args.high_frequency_weight
                     )
                 if use_clipiqa:
                     student_clipiqa = clipiqa(pred_frame).mean()
-                    teacher_clipiqa = clipiqa(target_frame).detach().mean()
+                    teacher_clipiqa = clipiqa(teacher_frame).detach().mean()
                     target_clipiqa = torch.maximum(
                         teacher_clipiqa,
                         teacher_clipiqa.new_tensor(args.clipiqa_target),
@@ -217,8 +264,10 @@ def main():
             loss = (
                 l1_loss
                 + mse_loss
+                + gt_l1_loss
                 + frame_diff_loss
                 + perceptual_loss
+                + lpips_loss
                 + high_frequency_loss
                 + clipiqa_loss
             )
@@ -231,8 +280,10 @@ def main():
             "loss": loss.item(),
             "l1_loss": l1_loss.item(),
             "mse_loss": mse_loss.item(),
+            "gt_l1_loss": gt_l1_loss.item(),
             "frame_diff_loss": frame_diff_loss.item(),
             "perceptual_loss": perceptual_loss.item(),
+            "lpips_loss": lpips_loss.item(),
             "high_frequency_loss": high_frequency_loss.item(),
             "clipiqa_loss": clipiqa_loss.item(),
             "student_clipiqa": student_clipiqa.item(),
